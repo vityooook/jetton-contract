@@ -60,13 +60,36 @@ export const promptAmount = async (prompt: string, decimals: number, provider: U
 }
 
 export const getLastBlock = async (provider: NetworkProvider) => {
-    return (await (provider.api() as TonClient4).getLastBlock()).last.seqno;
+    const api: any = provider.api();
+    if (api && typeof api.getLastBlock === 'function') {
+        const last = await api.getLastBlock();
+        // Support different shapes
+        return last.last ? last.last.seqno : last.seqno;
+    }
+    // Fallback to indexer
+    const res = await sendToIndex('block/latest', {}, provider);
+    return (res && (res.seqno ?? res.last?.seqno ?? res.block?.seqno)) as number;
 }
 export const getAccountLastTx = async (provider: NetworkProvider, address: Address) => {
-    const res = await (provider.api() as TonClient4).getAccountLite(await getLastBlock(provider), address);
-    if (res.account.last == null)
-        throw (Error("Contract is not active"));
-    return res.account.last.lt;
+    const api: any = provider.api();
+    // Try lite client path if available
+    if (api && typeof api.getAccountLite === 'function') {
+        const res = await api.getAccountLite(await getLastBlock(provider), address);
+        if (res.account.last == null)
+            throw (Error("Contract is not active"));
+        return res.account.last.lt;
+    }
+    // Try TonCenter client path
+    if (api && typeof api.getTransactions === 'function') {
+        const txs = await api.getTransactions(address, { limit: 1 });
+        if (Array.isArray(txs) && txs.length > 0) {
+            return txs[0].lt;
+        }
+        return null;
+    }
+    // Fallback to indexer
+    const acc = await sendToIndex('account', { address: address.toString() }, provider);
+    return acc?.last_transaction_id?.lt ?? acc?.last?.lt ?? acc?.last_transaction_lt ?? null;
 }
 export const waitForTransaction = async (provider: NetworkProvider, address: Address, curTx: string | null, maxRetry: number, interval: number = 1000) => {
     let done = false;
@@ -74,12 +97,11 @@ export const waitForTransaction = async (provider: NetworkProvider, address: Add
     const ui = provider.ui();
 
     do {
-        const lastBlock = await getLastBlock(provider);
         ui.write(`Awaiting transaction completion (${++count}/${maxRetry})`);
         await sleep(interval);
-        const curState = await (provider.api() as TonClient4).getAccountLite(lastBlock, address);
-        if (curState.account.last !== null) {
-            done = curState.account.last.lt !== curTx;
+        const latestLt = await getAccountLastTx(provider, address);
+        if (latestLt !== null) {
+            done = latestLt !== curTx;
         }
     } while (!done && count < maxRetry);
     return done;
@@ -228,7 +250,20 @@ export const sendToIndex = async (method: string, params: any, provider: Network
         // 'X-API-Key': apiKey
     };
 
-    const response = await fetch(rpc + method + '?' + new URLSearchParams(params), {
+    // Normalize params to strings to avoid [object Object]
+    const normalizedParams: Record<string, string> = Object.fromEntries(
+        Object.entries(params || {}).map(([k, v]) => {
+            if (v instanceof Address) {
+                return [k, v.toString()];
+            }
+            if (v !== null && v !== undefined && typeof (v as any).toString === 'function') {
+                return [k, (v as any).toString()];
+            }
+            return [k, String(v)];
+        })
+    );
+
+    const response = await fetch(rpc + method + '?' + new URLSearchParams(normalizedParams), {
         method: 'GET',
         headers: headers,
     });
@@ -236,7 +271,7 @@ export const sendToIndex = async (method: string, params: any, provider: Network
 }
 
 export const getAddressFormat = async (address: Address, provider: NetworkProvider, isTestnet: boolean) => {
-    const result = await sendToIndex('wallet', {address: address}, provider);
+    const result = await sendToIndex('wallet', {address: address.toString()}, provider);
 
     const nonBounceable = (result.status === "uninit") || (result.wallet_type && result.wallet_type.startsWith('wallet'));
 
